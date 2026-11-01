@@ -29,13 +29,8 @@ import java.util.Map;
 import java.util.Properties;
 import javax.annotation.Nullable;
 import org.apache.lucene.analysis.Analyzer;
-import org.apache.lucene.document.Document;
-import org.apache.lucene.document.DocumentStoredFieldVisitor;
 import org.apache.lucene.index.DirectoryReader;
-import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.IndexReader;
-import org.apache.lucene.index.IndexableField;
-import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.queryparser.classic.QueryParser;
 import org.apache.lucene.queryparser.classic.QueryParserBase;
 import org.apache.lucene.search.Collector;
@@ -43,13 +38,13 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
-import org.apache.pinot.segment.local.segment.creator.impl.text.LuceneTextIndexCreator;
 import org.apache.pinot.segment.local.segment.index.text.TextIndexConfigBuilder;
 import org.apache.pinot.segment.local.segment.store.TextIndexUtils;
 import org.apache.pinot.segment.local.utils.LuceneTextIndexUtils;
 import org.apache.pinot.segment.spi.V1Constants;
 import org.apache.pinot.segment.spi.index.TextIndexConfig;
 import org.apache.pinot.segment.spi.index.TextIndexConfig.DocIdTranslatorMode;
+import org.apache.pinot.segment.spi.index.reader.QueryScopedCache;
 import org.apache.pinot.segment.spi.index.reader.TextIndexReader;
 import org.apache.pinot.segment.spi.memory.PinotDataBuffer;
 import org.apache.pinot.segment.spi.store.SegmentDirectoryPaths;
@@ -79,6 +74,9 @@ public class LuceneTextIndexReader implements TextIndexReader {
   private final String _queryParserClass;
   private Constructor<QueryParserBase> _queryParserClassConstructor;
   private boolean _enablePrefixSuffixMatchingInPhraseQueries = false;
+  /// Everything about this column that changes how a search string parses. Two readers may share a
+  /// parsed query only when these are equal. Computed once; immutable, with structural equality.
+  private final ParseConfig _parseConfig;
 
   public LuceneTextIndexReader(String column, File indexDir, int numDocs, TextIndexConfig config) {
     _column = column;
@@ -112,6 +110,8 @@ public class LuceneTextIndexReader implements TextIndexReader {
       _queryParserClass = config.getLuceneQueryParserClass();
       _queryParserClassConstructor =
           TextIndexUtils.getQueryParserWithStringAndAnalyzerTypeConstructor(_queryParserClass);
+      // after the properties-file override above, so it reflects the configuration actually in force
+      _parseConfig = buildParseConfig(_column, config);
       LOGGER.info("Successfully read lucene index for {} from {}", _column, indexDir);
     } catch (Exception e) {
       LOGGER.error("Failed to instantiate Lucene text index reader for column {}, exception {}", column,
@@ -183,6 +183,8 @@ public class LuceneTextIndexReader implements TextIndexReader {
       _queryParserClass = config.getLuceneQueryParserClass();
       _queryParserClassConstructor =
           TextIndexUtils.getQueryParserWithStringAndAnalyzerTypeConstructor(_queryParserClass);
+      // after the properties-file override above, so it reflects the configuration actually in force
+      _parseConfig = buildParseConfig(_column, config);
 
       LOGGER.info("Successfully read lucene index for {} from buffer", _column);
     } catch (Exception e) {
@@ -225,10 +227,17 @@ public class LuceneTextIndexReader implements TextIndexReader {
 
   @Override
   public MutableRoaringBitmap getDocIds(String searchQuery, @Nullable String optionsString) {
+    return getDocIds(searchQuery, optionsString, null);
+  }
+
+  @Override
+  public MutableRoaringBitmap getDocIds(String searchQuery, @Nullable String optionsString,
+      @Nullable QueryScopedCache queryScopedCache) {
     MutableRoaringBitmap docIds = new MutableRoaringBitmap();
     Collector docIDCollector = new LuceneDocIdCollector(docIds, _docIdTranslator);
     try {
-      _indexSearcher.search(buildQuery(searchQuery, optionsString), docIDCollector);
+      validateDocCount();
+      _indexSearcher.search(buildQuery(searchQuery, optionsString, queryScopedCache), docIDCollector);
       return docIds;
     } catch (QueryException e) {
       throw e;
@@ -243,11 +252,58 @@ public class LuceneTextIndexReader implements TextIndexReader {
     }
   }
 
+  private void validateDocCount() {
+    int maxDoc = _indexReader.maxDoc();
+    // Collectors address maxDoc() space, including deleted documents. Skip mode has no mapping-buffer bounds check.
+    if (maxDoc > _numDocs) {
+      throw new IllegalStateException(
+          "Lucene text index contains " + maxDoc + " documents, exceeding segment document count: " + _numDocs);
+    }
+  }
+
+  /// Identifies a parsing configuration. A record so that equality is structural: comparing the
+  /// rendered text of these lists instead would conflate `["failed", "order"]` with
+  /// `["failed, order"]`, which are different stop-word sets that parse the same string differently.
+  private record ParseConfig(String column, String analyzerClass, List<String> analyzerArgs,
+                             List<String> analyzerArgTypes, List<String> stopWordsInclude,
+                             List<String> stopWordsExclude, boolean caseSensitive, String queryParserClass,
+                             boolean useANDForMultiTermQueries, boolean prefixSuffixMatchingInPhraseQueries) {
+    private ParseConfig {
+      analyzerArgs = copy(analyzerArgs);
+      analyzerArgTypes = copy(analyzerArgTypes);
+      stopWordsInclude = copy(stopWordsInclude);
+      stopWordsExclude = copy(stopWordsExclude);
+    }
+
+    private static List<String> copy(@Nullable List<String> values) {
+      return values == null ? List.of() : List.copyOf(values);
+    }
+  }
+
+  /// Cache key for one parsed query: the configuration plus the request-supplied text.
+  private record ParsedQueryKey(ParseConfig parseConfig, String searchQuery, @Nullable String optionsString) {
+  }
+
+  /// Carries a checked parse failure out of the cache's mapper so the original exception, and in
+  /// particular a [QueryException]'s error code, survives instead of being wrapped.
+  private static final class ParseFailure extends RuntimeException {
+    ParseFailure(Exception cause) {
+      super(cause);
+    }
+  }
+
+  private static ParseConfig buildParseConfig(String column, TextIndexConfig config) {
+    return new ParseConfig(column, config.getLuceneAnalyzerClass(), config.getLuceneAnalyzerClassArgs(),
+        config.getLuceneAnalyzerClassArgTypes(), config.getStopWordsInclude(), config.getStopWordsExclude(),
+        config.isCaseSensitive(), config.getLuceneQueryParserClass(), config.isUseANDForMultiTermQueries(),
+        config.isEnablePrefixSuffixMatchingInPhraseQueries());
+  }
+
   /// Parses a search string into a Lucene query, applying the configured parser and options.
   ///
   /// Shared by the doc-id and the count paths so that a `count(*)` and the filter it counts can never
   /// interpret the same query differently.
-  private Query buildQuery(String searchQuery)
+  private Query parseQueryWithoutOptions(String searchQuery)
       throws Exception {
     // Lucene query parsers are generally stateful and a new instance must be created per query.
     QueryParserBase parser = _queryParserClassConstructor.newInstance(_column, _analyzer);
@@ -269,18 +325,16 @@ public class LuceneTextIndexReader implements TextIndexReader {
 
   @Override
   public int getNumMatchingDocs(String searchQuery, @Nullable String optionsString) {
+    return getNumMatchingDocs(searchQuery, optionsString, null);
+  }
+
+  @Override
+  public int getNumMatchingDocs(String searchQuery, @Nullable String optionsString,
+      @Nullable QueryScopedCache queryScopedCache) {
     try {
-      // A Lucene index larger than the segment means the doc-id mapping is broken -- a state getDocIds
-      // surfaces as an IndexOutOfBoundsException from the translator. Counting does not consult the
-      // translator, so without this guard the corruption would become a silently inflated count instead.
-      // Compared against maxDoc(), not numDocs(): LuceneDocIdCollector indexes the translator by
-      // `context.docBase + doc`, which is maxDoc() space, and with deletions numDocs() < maxDoc() would let a
-      // broken index slip through. Fall back so that it keeps failing loudly.
-      if (_indexReader.maxDoc() > _numDocs) {
-        return getDocIds(searchQuery, optionsString).getCardinality();
-      }
+      validateDocCount();
       return LuceneTextIndexUtils.countWithoutMaterializing(_indexSearcher,
-          buildQuery(searchQuery, optionsString));
+          buildQuery(searchQuery, optionsString, queryScopedCache));
     } catch (QueryException e) {
       // A timeout or accountant kill arrives as a QueryException; wrapping it would erase its error code,
       // since only QueryException keeps its code through BaseSingleBlockCombineOperator.
@@ -292,19 +346,51 @@ public class LuceneTextIndexReader implements TextIndexReader {
     }
   }
 
-  /// Parses a search string into a Lucene query, honouring the options string when one is given.
+  /// Parses a search string into a Lucene query, honouring the options string when one is given, and
+  /// reusing the query already parsed for this request when a cache is given.
   ///
   /// Both [#getDocIds(String, String)] and [#getNumMatchingDocs] go through this method, so a `count(*)` and
   /// the filter it counts cannot interpret the same query differently. Keep it that way: any new entry point
   /// that parses a search string itself reintroduces that divergence.
+  ///
+  /// Every segment of a request parses the same string against the same configuration, so without a
+  /// cache the work is repeated once per segment. With a cache the string is parsed once per effective
+  /// parsing configuration rather than once per segment: one request can span segments whose text
+  /// indexes are configured differently, and those keep their own entries. A parse that throws caches
+  /// nothing, so the next segment retries and fails the same way.
+  ///
+  /// The returned query may be shared: Lucene queries are immutable and [Query#rewrite] does not
+  /// mutate them, so a multi-term query is still expanded per segment against that segment's own
+  /// term dictionary.
   @VisibleForTesting
-  Query buildQuery(String searchQuery, @Nullable String optionsString)
+  Query buildQuery(String searchQuery, @Nullable String optionsString, @Nullable QueryScopedCache queryScopedCache)
+      throws Exception {
+    if (queryScopedCache == null) {
+      return parseQuery(searchQuery, optionsString);
+    }
+    ParsedQueryKey key = new ParsedQueryKey(_parseConfig, searchQuery, optionsString);
+    try {
+      return queryScopedCache.getOrComputeSharedValue(Query.class, key, k -> {
+        try {
+          return parseQuery(k.searchQuery(), k.optionsString());
+        } catch (Exception e) {
+          throw new ParseFailure(e);
+        }
+      });
+    } catch (ParseFailure e) {
+      throw (Exception) e.getCause();
+    }
+  }
+
+  /// Parses unconditionally, bypassing any cache.
+  @VisibleForTesting
+  Query parseQuery(String searchQuery, @Nullable String optionsString)
       throws Exception {
     if (hasOptions(optionsString)) {
       LuceneTextIndexUtils.LuceneTextIndexOptions options = LuceneTextIndexUtils.createOptions(optionsString);
       return LuceneTextIndexUtils.createQueryParserWithOptions(searchQuery, options, _column, _analyzer);
     }
-    return buildQuery(searchQuery);
+    return parseQueryWithoutOptions(searchQuery);
   }
 
   /// Whether `optionsString` selects the options-driven parser, i.e. it is non-blank and parses to at least
@@ -389,73 +475,35 @@ public class LuceneTextIndexReader implements TextIndexReader {
             PinotDataBuffer.mapFile(docIdMappingFile, /* readOnly */ true, 0, length, ByteOrder.LITTLE_ENDIAN, desc);
 
         return new DefaultDocIdTranslator(buffer);
-      } else {
-        buffer =
-            PinotDataBuffer.mapFile(docIdMappingFile, /* readOnly */ false, 0, length, ByteOrder.LITTLE_ENDIAN, desc);
-
-        if (config.getDocIdTranslatorMode() == DocIdTranslatorMode.TryOptimize) {
-          LOGGER.debug("Creating lucene to pinot doc id mapping.");
-          boolean allIdsAreEqual = true;
-
-          class DocIdVisitor extends DocumentStoredFieldVisitor {
-            int _pinotDocId;
-
-            @Override
-            public Status needsField(FieldInfo fieldInfo) {
-              // assume doc id is the only stored document
-              assert LuceneTextIndexCreator.LUCENE_INDEX_DOC_ID_COLUMN_NAME.equals(fieldInfo.name);
-              return Status.YES;
-            }
-
-            @Override
-            public void intField(FieldInfo fieldInfo, int value) {
-              _pinotDocId = value;
-            }
-          }
-
-          DocIdVisitor visitor = new DocIdVisitor();
-          StoredFields storedFields = indexSearcher.storedFields();
-
-          for (int i = 0; i < numDocs; i++) {
-            storedFields.document(i, visitor);
-            int pinotDocId = visitor._pinotDocId;
-            allIdsAreEqual &= (i == pinotDocId);
-            buffer.putInt(i * Integer.BYTES, pinotDocId);
-          }
-
-          if (allIdsAreEqual) {
-            LOGGER.debug("Lucene doc ids are equal to Pinot's. Deleting mapping and updating index settings.");
-            // TODO: it'd be better to unmap without flushing the buffer. Only some buffer types support it, though.
-            buffer.close();
-            buffer = null;
-            // get rid of mapping and use lucene ids
-            docIdMappingFile.delete();
-
-            // mapping is unnecessary so store flag in config file to skip checking on next load
-            TextIndexConfig newConfig =
-                new TextIndexConfigBuilder(config).withDocIdTranslatorMode(DocIdTranslatorMode.Skip.name()).build();
-            TextIndexUtils.writeConfigToPropertiesFile(indexDir, newConfig);
-
-            return NoOpDocIdTranslator.INSTANCE;
-          } else {
-            LOGGER.debug("Lucene doc ids are not equal to Pinot's. Keeping the mapping.");
-            // mapping is required so switch to default mode
-            TextIndexConfig newConfig =
-                new TextIndexConfigBuilder(config).withDocIdTranslatorMode(DocIdTranslatorMode.Default.name()).build();
-            TextIndexUtils.writeConfigToPropertiesFile(indexDir, newConfig);
-
-            return new DefaultDocIdTranslator(buffer);
-          }
-        } else {
-          for (int i = 0; i < numDocs; i++) {
-            Document document = indexSearcher.doc(i);
-            IndexableField field = document.getField(LuceneTextIndexCreator.LUCENE_INDEX_DOC_ID_COLUMN_NAME);
-            int pinotDocId = Integer.parseInt(field.stringValue());
-            buffer.putInt(i * Integer.BYTES, pinotDocId);
-          }
-          return new DefaultDocIdTranslator(buffer);
-        }
       }
+      buffer =
+          PinotDataBuffer.mapFile(docIdMappingFile, /* readOnly */ false, 0, length, ByteOrder.LITTLE_ENDIAN, desc);
+      LOGGER.debug("Creating lucene to pinot doc id mapping.");
+      boolean isIdentityMapping =
+          TextIndexUtils.fillDocIdMapping(indexSearcher.getIndexReader(), buffer, numDocs, null);
+      if (config.getDocIdTranslatorMode() == DocIdTranslatorMode.TryOptimize) {
+        if (isIdentityMapping) {
+          LOGGER.debug("Lucene doc ids are equal to Pinot's. Deleting mapping and updating index settings.");
+          // TODO: it'd be better to unmap without flushing the buffer. Only some buffer types support it, though.
+          buffer.close();
+          buffer = null;
+          // get rid of mapping and use lucene ids
+          docIdMappingFile.delete();
+
+          // mapping is unnecessary so store flag in config file to skip checking on next load
+          TextIndexConfig newConfig =
+              new TextIndexConfigBuilder(config).withDocIdTranslatorMode(DocIdTranslatorMode.Skip.name()).build();
+          TextIndexUtils.writeConfigToPropertiesFile(indexDir, newConfig);
+
+          return NoOpDocIdTranslator.INSTANCE;
+        }
+        LOGGER.debug("Lucene doc ids are not equal to Pinot's. Keeping the mapping.");
+        // mapping is required so switch to default mode
+        TextIndexConfig newConfig =
+            new TextIndexConfigBuilder(config).withDocIdTranslatorMode(DocIdTranslatorMode.Default.name()).build();
+        TextIndexUtils.writeConfigToPropertiesFile(indexDir, newConfig);
+      }
+      return new DefaultDocIdTranslator(buffer);
     } catch (Exception e) {
       if (buffer != null) {
         buffer.close();
@@ -489,53 +537,17 @@ public class LuceneTextIndexReader implements TextIndexReader {
     PinotDataBuffer buffer = PinotDataBuffer.allocateDirect(length, ByteOrder.LITTLE_ENDIAN, desc);
 
     try {
+      LOGGER.debug("Creating lucene to pinot doc id mapping.");
+      boolean isIdentityMapping = TextIndexUtils.fillDocIdMapping(_indexReader, buffer, numDocs, null);
       if (config.getDocIdTranslatorMode() == DocIdTranslatorMode.TryOptimize) {
-        LOGGER.debug("Creating lucene to pinot doc id mapping.");
-        boolean allIdsAreEqual = true;
-
-        class DocIdVisitor extends DocumentStoredFieldVisitor {
-          int _pinotDocId;
-
-          @Override
-          public Status needsField(FieldInfo fieldInfo) {
-            // assume doc id is the only stored document
-            assert LuceneTextIndexCreator.LUCENE_INDEX_DOC_ID_COLUMN_NAME.equals(fieldInfo.name);
-            return Status.YES;
-          }
-
-          @Override
-          public void intField(FieldInfo fieldInfo, int value) {
-            _pinotDocId = value;
-          }
-        }
-
-        DocIdVisitor visitor = new DocIdVisitor();
-        StoredFields storedFields = _indexSearcher.storedFields();
-
-        for (int i = 0; i < numDocs; i++) {
-          storedFields.document(i, visitor);
-          int pinotDocId = visitor._pinotDocId;
-          allIdsAreEqual &= (i == pinotDocId);
-          buffer.putInt(i * Integer.BYTES, pinotDocId);
-        }
-
-        if (allIdsAreEqual) {
+        if (isIdentityMapping) {
           LOGGER.debug("Lucene doc ids are equal to Pinot's. Using no-op translator.");
           buffer.close();
           return NoOpDocIdTranslator.INSTANCE;
-        } else {
-          LOGGER.debug("Lucene doc ids are not equal to Pinot's. Using default translator.");
-          return new DefaultDocIdTranslator(buffer);
         }
-      } else {
-        for (int i = 0; i < numDocs; i++) {
-          Document document = _indexSearcher.doc(i);
-          IndexableField field = document.getField(LuceneTextIndexCreator.LUCENE_INDEX_DOC_ID_COLUMN_NAME);
-          int pinotDocId = Integer.parseInt(field.stringValue());
-          buffer.putInt(i * Integer.BYTES, pinotDocId);
-        }
-        return new DefaultDocIdTranslator(buffer);
+        LOGGER.debug("Lucene doc ids are not equal to Pinot's. Using default translator.");
       }
+      return new DefaultDocIdTranslator(buffer);
     } catch (Exception e) {
       buffer.close();
       throw new RuntimeException("Caught exception while creating doc id translator for text index column: " + _column,

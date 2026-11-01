@@ -24,7 +24,7 @@
   <parent>
     <artifactId>pinot</artifactId>
     <groupId>org.apache.pinot</groupId>
-    <version>1.6.0-SNAPSHOT</version>
+    <version>1.7.0-SNAPSHOT</version>
   </parent>
   <artifactId>pinot-integration-tests</artifactId>
   <name>Pinot Integration Tests</name>
@@ -222,7 +222,6 @@
                 <include>org/apache/pinot/integration/tests/M*Test.java</include>
                 <include>org/apache/pinot/integration/tests/N*Test.java</include>
                 <include>org/apache/pinot/integration/tests/GrpcBrokerClusterIntegrationTest.java</include>
-                <include>org/apache/pinot/integration/tests/TenantRebalanceIntegrationTest.java</include>
                 <include>org/apache/pinot/integration/tests/legacy/*Test.java</include>
               </includes>
               <excludes>
